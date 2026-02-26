@@ -24,7 +24,89 @@
 #include <thread>
 #include <chrono>
 #include <pthread.h>
-#ifdef __aarch64__
+#include <cerrno>
+#include <csignal>
+#include <cstdlib>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
+#define SHM_KEY 0x1337
+#define RING_SIZE 512
+
+// HugePage support on macOS is different (VM_FLAGS_SUPERPAGE_SIZE_2MB), but for dev/sim we can omit flags if needed or mock them.
+// SHM_HUGETLB is Linux specific.
+#ifndef SHM_HUGETLB
+#define SHM_HUGETLB 0
+#endif
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE MADV_NORMAL
+#endif
+
+static_assert(std::atomic<uint64_t>::is_always_lock_free,
+    "FATAL: std::atomic<uint64_t> must be lock-free for cross-process SHM safety.");
+
+struct alignas(64) NormalizedTick {
+    uint8_t  venue_id;
+    uint32_t asset_id;
+    uint64_t timestamp_ns;
+    double   bid_price;
+    double   ask_price;
+    double   bid_size;
+    double   ask_size;
+    uint8_t  padding[16];
+};
+static_assert(sizeof(NormalizedTick) == 64, "NormalizedTick must be exactly 1 cache line");
+
+struct ShmRingBuffer {
+    alignas(64) std::atomic<uint32_t> head;
+    alignas(64) std::atomic<uint32_t> tail;
+    NormalizedTick ticks[RING_SIZE];
+};
+static_assert(sizeof(ShmRingBuffer) <= (2 * 1024 * 1024), "ShmRingBuffer must fit in a 2MB HugePage");
+
+void safe_fallocate(int fd, off_t offset, off_t len, const char* path) {
+    // macOS does not have posix_fallocate the same way Linux does, or it might but fcntl F_PREALLOCATE is preferred.
+    // For portability in this environment:
+    #ifdef __APPLE__
+        fstore_t store = {F_ALLOCATECONTIG, F_PEOFPOSMODE, 0, len};
+        if (fcntl(fd, F_PREALLOCATE, &store) == -1) {
+             store.fst_flags = F_ALLOCATEALL; 
+             fcntl(fd, F_PREALLOCATE, &store);
+        }
+        ftruncate(fd, len);
+    #else
+        int ret;
+        do {
+            ret = posix_fallocate(fd, offset, len);
+        } while (ret == EINTR);
+
+        if (ret == ENOSPC) {
+            std::cerr << "[FATAL] posix_fallocate: No space left on device for "
+                    << path << ". Free at least " << len << " bytes.\n";
+            close(fd);
+            std::abort();
+        } else if (ret == EFBIG) {
+            std::cerr << "[FATAL] posix_fallocate: File size limit exceeded.\n";
+            close(fd);
+            std::abort();
+        } else if (ret != 0) {
+            std::cerr << "[FATAL] posix_fallocate: " << strerror(ret) << "\n";
+            close(fd);
+            std::abort();
+        }
+    #endif
+
+    struct stat st;
+    fstat(fd, &st);
+    if (st.st_size < (offset + len)) {
+        std::cerr << "[FATAL] posix_fallocate: Allocation silently failed (sparse FS?).\n";
+        std::abort();
+    }
+}
+
+#if defined(__aarch64__)
     // Apple Silicon / ARM64
     inline uint64_t rdtsc_serialized() {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -36,7 +118,6 @@
     }
 #else
     // x86_64
-    #include <immintrin.h>
     inline uint64_t rdtsc_serialized() {
         _mm_lfence();
         uint64_t tsc = __builtin_ia32_rdtsc();
@@ -68,7 +149,16 @@ public:
             }
         }
 
+        if (shm_id < 0) {
+            perror("shmget");
+            exit(1);
+        }
+
         ring_buffer = (ShmRingBuffer*)shmat(shm_id, NULL, 0);
+        if (ring_buffer == (void*)-1) {
+            perror("shmat");
+            exit(1);
+        }
         madvise(ring_buffer, sizeof(ShmRingBuffer), MADV_HUGEPAGE | MADV_SEQUENTIAL);
 
         if (!is_existing_shm) {
@@ -124,6 +214,7 @@ public:
         uint32_t head = ring_buffer->head.load(std::memory_order_acquire);
         int count = 0;
         while (tail != head && count < max_count) {
+            // __builtin_prefetch is generic in GCC/Clang, works on ARM too
             __builtin_prefetch(&ring_buffer->ticks[(tail + 2) & (RING_SIZE - 1)], 0, 3);
             out[count++] = ring_buffer->ticks[tail];
             tail = (tail + 1) & (RING_SIZE - 1);

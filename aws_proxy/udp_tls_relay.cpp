@@ -26,8 +26,11 @@
 #include <openssl/err.h>
 #include <openssl/hmac.h>
 #include <openssl/crypto.h>
-#include <immintrin.h>
 #include <cstdlib>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 #define RELAY_UDP_PORT 13370
 #define POLYMARKET_HOST "clob.polymarket.com"
@@ -43,11 +46,32 @@ int active_tcp_fd = -1;
 
 uint8_t RELAY_PSK[32];
 
-uint64_t rdtsc_to_ns() {
-    uint64_t tsc = __builtin_ia32_rdtsc();
-    static constexpr double TSC_NS_PER_CYCLE = 0.4; // ~2.5 GHz CPU
-    return (uint64_t)(tsc * TSC_NS_PER_CYCLE);
-}
+#ifdef __aarch64__
+    // Apple Silicon / ARM64
+    uint64_t rdtsc_to_ns() {
+        uint64_t tsc;
+        asm volatile("mrs %0, cntvct_el0" : "=r"(tsc));
+        // Simple monotonic time since tsc scaling is complex
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    }
+    
+    inline void cpu_relax() {
+        asm volatile("yield");
+    }
+#else
+    // x86_64
+    uint64_t rdtsc_to_ns() {
+        uint64_t tsc = __builtin_ia32_rdtsc();
+        static constexpr double TSC_NS_PER_CYCLE = 0.4; // ~2.5 GHz CPU
+        return (uint64_t)(tsc * TSC_NS_PER_CYCLE);
+    }
+
+    inline void cpu_relax() {
+        _mm_pause();
+    }
+#endif
 
 SSL_CTX* init_ssl_context() {
     SSL_library_init();
@@ -173,7 +197,7 @@ void relay_hot_path() {
                 std::cout << "[RELAY-OK] Forwarded " << payload_len << " bytes.\n";
             }
         } else {
-            _mm_pause();
+            cpu_relax();
         }
     }
 
@@ -201,19 +225,24 @@ int main() {
 
     std::cout << "[PSK] Loaded 32-byte relay secret from RELAY_PSK_HEX.\n";
 
-    // CPU affinity
+    // CPU affinity (Linux only)
+    #if defined(__linux__)
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(0, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    #endif
 
     SSL_CTX* ctx = init_ssl_context();
     connect_to_polymarket(ctx);
 
     std::thread hb(keep_alive_loop);
+    
+    #if defined(__linux__)
     CPU_ZERO(&cpuset);
     CPU_SET(1, &cpuset);
     pthread_setaffinity_np(hb.native_handle(), sizeof(cpu_set_t), &cpuset);
+    #endif
 
     relay_hot_path();
     hb.join();
