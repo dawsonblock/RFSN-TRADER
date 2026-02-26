@@ -16,24 +16,30 @@ else
 endif
 
 CXX        = g++
-CXXFLAGS   = -std=c++20 -O3 -march=native -Wall -Wextra -pthread -fPIC $(OPENSSL_INCLUDE)
+CXXFLAGS   = -std=c++20 -O3 -march=native -Wall -Wextra -pthread -fPIC $(OPENSSL_INCLUDE) -Wno-deprecated-declarations
 LDFLAGS    = $(OPENSSL_LIB) -lssl -lcrypto -pthread
 
 DAEMON_SRC     = src/market_daemon.cpp
 RELAY_SRC      = aws_proxy/udp_tls_relay.cpp
+SENDER_SRC     = src/udp_sender.cpp
+
 DAEMON_OBJ     = build/market_daemon.o
 RELAY_OBJ      = build/udp_tls_relay.o
+SENDER_OBJ     = build/udp_sender.o
 
 DAEMON_BIN     = bin/market_daemon
 RELAY_BIN      = bin/udp_tls_relay
+SENDER_BIN     = bin/udp_sender
 
-.PHONY: all daemon relay clean help
+.PHONY: all daemon relay sender clean help
 
-all: daemon relay
+all: daemon relay sender
 
 daemon: $(DAEMON_BIN)
 
 relay: $(RELAY_BIN)
+
+sender: $(SENDER_BIN)
 
 $(DAEMON_BIN): $(DAEMON_OBJ)
 	@mkdir -p bin
@@ -45,11 +51,20 @@ $(RELAY_BIN): $(RELAY_OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "[BUILD] ✓ udp_tls_relay compiled"
 
+$(SENDER_BIN): $(SENDER_OBJ)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "[BUILD] ✓ udp_sender compiled"
+
 $(DAEMON_OBJ): $(DAEMON_SRC)
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 $(RELAY_OBJ): $(RELAY_SRC)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+$(SENDER_OBJ): $(SENDER_SRC)
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 

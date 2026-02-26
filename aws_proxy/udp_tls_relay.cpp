@@ -2,10 +2,8 @@
  * ============================================================================
  * PROJECT: HEAB + SBM Financial Execution Stack v7.0
  * MODULE: udp_tls_relay.cpp
- * PURPOSE: Deployed to AWS us-east-1 to bypass Saskatoon geoblocking.
- * CORRECTIONS IN V7.0:
- * - HMAC-SHA256 + replay window replaces trivial IP whitelist
- * - Constant-time HMAC comparison prevents timing oracle
+ * PURPOSE: Coherent, authenticated UDP -> TLS Relay
+ * PROTOCOL: [SEQ(4)][TS(8)][KEY_ID(1)][HMAC(32)][PAYLOAD(N)]
  * ============================================================================
  */
 
@@ -13,6 +11,8 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <vector>
+#include <unordered_map>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -27,87 +27,111 @@
 #include <openssl/hmac.h>
 #include <openssl/crypto.h>
 #include <cstdlib>
+#include <ctime>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
+// MacOS / Linux Endianness Portability
+#ifdef __APPLE__
+#include <libkern/OSByteOrder.h>
+#define htobe64(x) OSSwapHostToBigInt64(x)
+#define be64toh(x) OSSwapBigToHostInt64(x)
+#else
+#include <endian.h>
 #endif
 
+// Configuration
 #define RELAY_UDP_PORT 13370
 #define POLYMARKET_HOST "clob.polymarket.com"
 #define POLYMARKET_PORT "443"
+#define REPLAY_WINDOW_NS 2000000000ULL // 2 seconds
 
-// HMAC packet format: [4-byte seq] [8-byte timestamp_ns] [32-byte HMAC] [payload]
-static constexpr size_t RELAY_HEADER_SIZE = 4 + 8 + 32;
-static constexpr uint64_t REPLAY_WINDOW_NS = 5'000'000'000ULL; // 5 seconds
+// Protocol Definition
+// Header: [SEQ(4)] [TS(8)] [KEY_ID(1)] [MAC(32)]
+static constexpr size_t RELAY_HEADER_SIZE = 45;
+static constexpr size_t MAC_OFFSET = 13; // 4 + 8 + 1
+static constexpr size_t MAC_SIZE = 32;
+
+// Key Store (In production, load from vault/env)
+// map<key_id, psk>
+static std::unordered_map<uint8_t, std::string> KEY_STORE;
 
 std::atomic<bool> running{true};
 SSL* active_ssl = nullptr;
 int active_tcp_fd = -1;
 
-uint8_t RELAY_PSK[32];
+// Helper: Get monotonic epoch time in nanoseconds
+uint64_t epoch_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 
-#ifdef __aarch64__
-    // Apple Silicon / ARM64
-    uint64_t rdtsc_to_ns() {
-        uint64_t tsc;
-        asm volatile("mrs %0, cntvct_el0" : "=r"(tsc));
-        // Simple monotonic time since tsc scaling is complex
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+void load_keys() {
+    // Default key for ID 1
+    const char* psk_hex = std::getenv("RELAY_PSK_HEX");
+    if (psk_hex && std::strlen(psk_hex) == 64) {
+        std::string psk_bytes;
+        for (size_t i = 0; i < 32; i++) {
+            char byte_str[3] = {psk_hex[i*2], psk_hex[i*2+1], '\0'};
+            psk_bytes.push_back((char)std::strtol(byte_str, nullptr, 16));
+        }
+        KEY_STORE[1] = psk_bytes;
+        std::cout << "[INIT] Loaded Key ID 1 from environment.\n";
+    } else {
+        std::cerr << "[WARN] No RELAY_PSK_HEX found. Using hardcoded test key for ID 1.\n";
+        KEY_STORE[1] = std::string(32, 'A'); // Dummy key
     }
-    
-    inline void cpu_relax() {
-        asm volatile("yield");
-    }
-#else
-    // x86_64
-    uint64_t rdtsc_to_ns() {
-        uint64_t tsc = __builtin_ia32_rdtsc();
-        static constexpr double TSC_NS_PER_CYCLE = 0.4; // ~2.5 GHz CPU
-        return (uint64_t)(tsc * TSC_NS_PER_CYCLE);
-    }
-
-    inline void cpu_relax() {
-        _mm_pause();
-    }
-#endif
+}
 
 SSL_CTX* init_ssl_context() {
     SSL_library_init();
     OpenSSL_add_all_algorithms();
     SSL_load_error_strings();
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    const SSL_METHOD* method = TLS_client_method();
+    SSL_CTX* ctx = SSL_CTX_new(method);
     if (!ctx) {
         std::cerr << "[FATAL] SSL_CTX_new failed.\n";
-        std::exit(EXIT_FAILURE);
+        exit(EXIT_FAILURE);
     }
     return ctx;
 }
 
 void connect_to_polymarket(SSL_CTX* ctx) {
+    if (active_ssl) {
+        SSL_shutdown(active_ssl);
+        SSL_free(active_ssl);
+        active_ssl = nullptr;
+    }
+    if (active_tcp_fd >= 0) {
+        close(active_tcp_fd);
+        active_tcp_fd = -1;
+    }
+
     struct addrinfo hints{}, *res;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
+
     if (getaddrinfo(POLYMARKET_HOST, POLYMARKET_PORT, &hints, &res) != 0) {
-        std::cerr << "[FATAL] getaddrinfo failed.\n";
-        std::exit(EXIT_FAILURE);
+        std::cerr << "[ERR] getaddrinfo failed. Retrying...\n";
+        return;
     }
 
     active_tcp_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (active_tcp_fd < 0) {
-        std::cerr << "[FATAL] socket() failed.\n";
-        std::exit(EXIT_FAILURE);
+        std::cerr << "[ERR] socket failed.\n";
+        freeaddrinfo(res);
+        return;
     }
 
     int flag = 1;
     setsockopt(active_tcp_fd, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
 
     if (connect(active_tcp_fd, res->ai_addr, res->ai_addrlen) < 0) {
-        std::cerr << "[FATAL] connect() to Polymarket failed.\n";
-        std::exit(EXIT_FAILURE);
+        std::cerr << "[ERR] connect failed.\n";
+        close(active_tcp_fd);
+        active_tcp_fd = -1;
+        freeaddrinfo(res);
+        return;
     }
-
     freeaddrinfo(res);
 
     active_ssl = SSL_new(ctx);
@@ -115,137 +139,161 @@ void connect_to_polymarket(SSL_CTX* ctx) {
     SSL_set_fd(active_ssl, active_tcp_fd);
 
     if (SSL_connect(active_ssl) <= 0) {
-        std::cerr << "[FATAL] SSL_connect failed.\n";
-        std::exit(EXIT_FAILURE);
+        std::cerr << "[ERR] SSL_connect failed.\n";
+        SSL_free(active_ssl);
+        active_ssl = nullptr;
+        close(active_tcp_fd);
+        active_tcp_fd = -1;
+        return;
     }
 
-    std::cout << "[TLS] Connection Warmed and Locked." << std::endl;
+    std::cout << "[TLS] Connection Established to " << POLYMARKET_HOST << "\n";
 }
 
-void keep_alive_loop() {
-    const std::string ping_req = "GET /time HTTP/1.1\r\nHost: clob.polymarket.com\r\nConnection: keep-alive\r\n\r\n";
-    while (running.load(std::memory_order_relaxed)) {
+void keep_alive_loop(SSL_CTX* ctx) {
+    const std::string ping_req = "GET /time HTTP/1.1\r\nHost: " POLYMARKET_HOST "\r\nConnection: keep-alive\r\n\r\n";
+    while (running) {
         std::this_thread::sleep_for(std::chrono::seconds(5));
-        if (active_ssl) {
-            SSL_write(active_ssl, (const uint8_t*)ping_req.c_str(), ping_req.length());
+        
+        if (!active_ssl) {
+            connect_to_polymarket(ctx);
+            continue;
+        }
+
+        int written = SSL_write(active_ssl, ping_req.c_str(), ping_req.length());
+        if (written <= 0) {
+            std::cerr << "[TLS] Keep-alive write failed. Reconnecting...\n";
+            connect_to_polymarket(ctx);
         }
     }
 }
 
-bool verify_relay_packet(const uint8_t* buf, int len) {
+bool verify_packet(uint8_t* buffer, int len, int& payload_offset, int& payload_len) {
     if (len < (int)RELAY_HEADER_SIZE) return false;
 
-    // Extract timestamp and verify replay window
-    uint64_t ts;
-    memcpy(&ts, buf + 4, 8);
-    uint64_t now_ns = rdtsc_to_ns();
-    if (llabs((int64_t)(now_ns - ts)) > (int64_t)REPLAY_WINDOW_NS) {
-        std::cerr << "[REPLAY-REJECT] Timestamp outside 5s window.\n";
+    // 1. Parsing
+    uint32_t seq_net;
+    uint64_t ts_net;
+    uint8_t key_id;
+    
+    std::memcpy(&seq_net, buffer, 4);
+    std::memcpy(&ts_net, buffer + 4, 8);
+    key_id = buffer[12];
+
+    uint32_t seq = ntohl(seq_net);
+    uint64_t ts = be64toh(ts_net);
+    (void)seq; // unused but parsed
+
+    // 2. Timestamp check (Replay)
+    uint64_t now = epoch_ns();
+    int64_t diff = (int64_t)(now - ts); // can be negative if clocks drift slightly forward
+    if (std::abs(diff) > (int64_t)REPLAY_WINDOW_NS) {
+        std::cerr << "[REJECT] Timestamp skew > 2s. Diff: " << diff << "ns\n";
         return false;
     }
 
-    // Verify HMAC over [seq + timestamp + payload]
-    uint8_t expected_mac[32];
-    unsigned int mac_len = 32;
-    HMAC(EVP_sha256(), RELAY_PSK, 32,
-         buf, len - 32,  // Everything except the MAC bytes
-         expected_mac, &mac_len);
+    // 3. Key Lookup
+    if (KEY_STORE.find(key_id) == KEY_STORE.end()) {
+        std::cerr << "[REJECT] Unknown Key ID: " << (int)key_id << "\n";
+        return false;
+    }
+    const std::string& key = KEY_STORE[key_id];
 
-    // Constant-time compare (prevents timing oracle)
-    if (CRYPTO_memcmp(buf + len - 32, expected_mac, 32) != 0) {
-        std::cerr << "[HMAC-REJECT] Authentication failed.\n";
+    // 4. HMAC Verify
+    // The MAC in the packet is at offset 13 (4+8+1)
+    uint8_t* received_mac = buffer + MAC_OFFSET;
+    
+    // Data covered by MAC: [SEQ][TS][KEY_ID]... [PAYLOAD]
+    // Basically everything EXCEPT the MAC bytes themselves.
+    // To preserve zero-copyish behavior, we hash the prefix (0-13) and suffix (45-end).
+    
+    uint8_t calculated_mac[EVP_MAX_MD_SIZE];
+    unsigned int mac_len;
+    
+    HMAC_CTX* hmac_ctx = HMAC_CTX_new();
+    HMAC_Init_ex(hmac_ctx, key.data(), key.size(), EVP_sha256(), nullptr);
+    
+    // Header parts before MAC
+    HMAC_Update(hmac_ctx, buffer, MAC_OFFSET);
+    
+    // Payload parts after MAC
+    payload_offset = RELAY_HEADER_SIZE;
+    payload_len = len - RELAY_HEADER_SIZE;
+    if (payload_len > 0) {
+        HMAC_Update(hmac_ctx, buffer + payload_offset, payload_len);
+    }
+    
+    HMAC_Final(hmac_ctx, calculated_mac, &mac_len);
+    HMAC_CTX_free(hmac_ctx);
+
+    if (CRYPTO_memcmp(received_mac, calculated_mac, 32) != 0) {
+        std::cerr << "[REJECT] HMAC Mismatch\n";
         return false;
     }
 
     return true;
 }
 
-void relay_hot_path() {
-    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (udp_fd < 0) {
-        std::cerr << "[FATAL] socket(SOCK_DGRAM) failed.\n";
-        std::exit(EXIT_FAILURE);
+void udp_server_loop() {
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("socket");
+        exit(1);
     }
 
-    int flags = fcntl(udp_fd, F_GETFL, 0);
-    fcntl(udp_fd, F_SETFL, flags | O_NONBLOCK);
+    // Non-blocking
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 
-    struct sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(RELAY_UDP_PORT);
+    struct sockaddr_in servaddr{}, cliaddr{};
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = INADDR_ANY;
+    servaddr.sin_port = htons(RELAY_UDP_PORT); // 13370
 
-    if (bind(udp_fd, (const struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        std::cerr << "[FATAL] bind() failed.\n";
-        std::exit(EXIT_FAILURE);
+    if (bind(sockfd, (const struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+        perror("bind");
+        exit(1);
     }
 
-    uint8_t buffer[2048];
-    struct sockaddr_in client_addr{};
-    socklen_t client_len = sizeof(client_addr);
+    std::cout << "[UDP] Listening on port " << RELAY_UDP_PORT << "\n";
 
-    std::cout << "[HOT-PATH] Busy-polling active (HMAC + replay protection enabled)." << std::endl;
+    uint8_t buffer[4096];
+    socklen_t len;
 
-    while (running.load(std::memory_order_relaxed)) {
-        int len = recvfrom(udp_fd, buffer, sizeof(buffer), 0,
-                           (struct sockaddr*)&client_addr, &client_len);
-        if (len > 0) {
-            if (verify_relay_packet(buffer, len)) {
-                // Strip the header and send only the payload
-                int payload_len = len - RELAY_HEADER_SIZE;
-                SSL_write(active_ssl, buffer + RELAY_HEADER_SIZE, payload_len);
-                std::cout << "[RELAY-OK] Forwarded " << payload_len << " bytes.\n";
+    while (running) {
+        len = sizeof(cliaddr);
+        int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr*)&cliaddr, &len);
+        
+        if (n > 0) {
+            int p_offset, p_len;
+            if (verify_packet(buffer, n, p_offset, p_len)) {
+                 if (active_ssl && p_len > 0) {
+                     int written = SSL_write(active_ssl, buffer + p_offset, p_len);
+                     if (written > 0) {
+                         std::cout << "[FWD] " << p_len << " bytes to TLS\n";
+                     } else {
+                         std::cerr << "[ERR] SSL_write failed\n";
+                     }
+                 } else {
+                     std::cerr << "[DROP] No active TLS connection\n";
+                 }
             }
         } else {
-            cpu_relax();
+            // Busy loop yield
+             std::this_thread::yield(); 
         }
     }
-
-    close(udp_fd);
+    close(sockfd);
 }
 
 int main() {
-    // Load PSK from environment variable
-    const char* psk_hex = std::getenv("RELAY_PSK_HEX");
-    if (!psk_hex) {
-        std::cerr << "[FATAL] Set RELAY_PSK_HEX environment variable (64 hex chars).\n";
-        std::exit(EXIT_FAILURE);
-    }
-
-    // Parse hex into 32 bytes
-    if (std::strlen(psk_hex) != 64) {
-        std::cerr << "[FATAL] RELAY_PSK_HEX must be 64 hex characters (32 bytes).\n";
-        std::exit(EXIT_FAILURE);
-    }
-
-    for (int i = 0; i < 32; i++) {
-        char byte_str[3] = {psk_hex[i*2], psk_hex[i*2+1], '\0'};
-        RELAY_PSK[i] = (uint8_t)std::strtol(byte_str, nullptr, 16);
-    }
-
-    std::cout << "[PSK] Loaded 32-byte relay secret from RELAY_PSK_HEX.\n";
-
-    // CPU affinity (Linux only)
-    #if defined(__linux__)
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(0, &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-    #endif
-
+    load_keys();
     SSL_CTX* ctx = init_ssl_context();
     connect_to_polymarket(ctx);
 
-    std::thread hb(keep_alive_loop);
-    
-    #if defined(__linux__)
-    CPU_ZERO(&cpuset);
-    CPU_SET(1, &cpuset);
-    pthread_setaffinity_np(hb.native_handle(), sizeof(cpu_set_t), &cpuset);
-    #endif
-
-    relay_hot_path();
+    std::thread hb(keep_alive_loop, ctx);
+    udp_server_loop();
     hb.join();
-
+    SSL_CTX_free(ctx);
     return 0;
 }
