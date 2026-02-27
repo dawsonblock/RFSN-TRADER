@@ -70,42 +70,26 @@ class HardwareDirectBridge:
 
     def trigger_fpga_tcp_offload(self, digest, raw_http_bytes, offsets):
         """
-        Sends the specific HTTP packet to the local UDP-DTLS Relay using the C++ Client.
+        Sends the specific raw bytes to the local UDP Proxy (dtls_client daemon).
         """
         try:
-            msg = raw_http_bytes.decode('ascii')
-        except UnicodeDecodeError:
-            msg = raw_http_bytes.decode('utf-8', errors='ignore')
-            
-        print(f"[DTLS-Relay] Offloading HTTP Packet (Length {len(msg)}) to {self.host}:{self.port}")
+            # We don't need to decode strictly, just send raw bytes
+            # But legacy logging used decode
+            pass 
+        except:
+             pass
+
+        print(f"[DTLS-Proxy] Forwarding HTTP Packet (Length {len(raw_http_bytes)}) to Local Daemon 127.0.0.1:5000")
         
-        # Invoke C++ DTLS Client
-        # Usage: ./bin/dtls_client <host> <port> <identity> <psk_key_hex> <message>
         try:
-            cmd = [
-                self.bin_path,
-                self.host,
-                str(self.port),
-                self.identity,
-                self.psk_hex,
-                msg
-            ]
-            
-            # Using subprocess to execute the client
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False 
-            )
-            
-            if result.returncode != 0:
-                print(f"[ERROR] DTLS Client Failed: {result.stderr}")
-            else:
-                print(f"[SUCCESS] DTLS Client Output: {result.stdout.strip()}")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Send to local Daemon port
+            sock.sendto(raw_http_bytes, ("127.0.0.1", 5000))
+            sock.close()
+            print("[SUCCESS] Sent to Daemon")
                 
         except Exception as e:
-            print(f"[FAILURE] DTLS Subprocess error: {e}")
+            print(f"[FAILURE] Socket send error: {e}")
 
 
 
@@ -285,8 +269,12 @@ class PolymarketRouterV7:
         s_offset = 0
         
         # Offload to UDP Relay
-        self.bridge.trigger_fpga_tcp_offload(digest, http_packet, (r_offset, s_offset))
+        # self.bridge.trigger_fpga_tcp_offload(digest, http_packet, (r_offset, s_offset))
         
+        # New UDP Proxy Logic: Just send the bytes directly.
+        # This keeps the method signature of trigger_fpga_tcp_offload intact but changes implementation.
+        self.bridge.trigger_fpga_tcp_offload(digest, http_packet, (r_offset, s_offset))
+
         return {
             "http_packet": http_packet,
             "nonce": nonce

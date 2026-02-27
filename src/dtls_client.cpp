@@ -58,8 +58,9 @@ unsigned int psk_client_cb(SSL *ssl, const char *hint, char *identity, unsigned 
 }
 
 int main(int argc, char **argv) {
-    if (argc < 6) {
-        std::cerr << "Usage: " << argv[0] << " <host> <port> <identity> <psk_key_hex> <message>" << std::endl;
+    if (argc < 5) {
+        std::cerr << "Usage: " << argv[0] << " <host> <port> <identity> <psk_key_hex>" << std::endl;
+        std::cerr << "Acts as a daemon proxy listening on localhost:5000" << std::endl;
         return 1;
     }
 
@@ -67,7 +68,6 @@ int main(int argc, char **argv) {
     int port = std::stoi(argv[2]);
     std::string identity = argv[3];
     std::string key_hex = argv[4];
-    std::string message = argv[5];
 
     SSL_library_init();
     SSL_load_error_strings();
@@ -142,13 +142,45 @@ int main(int argc, char **argv) {
 
     std::cout << "[DTLS] Handshake Complete. Cipher: " << SSL_get_cipher(ssl) << std::endl;
 
-    // Send Message
-    int len = SSL_write(ssl, message.c_str(), message.length());
-    if (len <= 0) {
-        fprintf(stderr, "SSL_write failed\n");
-        ERR_print_errors_fp(stderr);
-    } else {
-        std::cout << "[DTLS] Sent " << len << " bytes: " << message << std::endl;
+// Loop to forward local UDP packets to DTLS
+    // Create Local UDP Socket for binding
+    int local_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (local_sock < 0) {
+        perror("local socket");
+        return 5;
+    }
+
+    struct sockaddr_in local_addr;
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
+    local_addr.sin_port = htons(5000); // Fixed local port for Router to send to
+
+    if (bind(local_sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+        perror("bind local");
+        return 5;
+    }
+
+    std::cout << "[DTLS] Daemon Ready. Listening on 127.0.0.1:5000..." << std::endl;
+
+    char buffer[4096];
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+
+    while (true) {
+        // Simple blocking recvfrom
+        ssize_t n = recvfrom(local_sock, buffer, sizeof(buffer) - 1, 0, (struct sockaddr *)&client_addr, &client_len);
+        if (n > 0) {
+            std::cout << "[DTLS] Proxying " << n << " bytes to Upstream Relay..." << std::endl;
+            int written = SSL_write(ssl, buffer, n);
+            if (written <= 0) {
+                fprintf(stderr, "SSL_write failed\n");
+                ERR_print_errors_fp(stderr);
+                // Attempt reconnect? For now, just exit or continue. 
+                // If connection is dead, we probably should exit so supervisor restarts us.
+                break;
+            }
+        }
     }
 
     // Cleanup

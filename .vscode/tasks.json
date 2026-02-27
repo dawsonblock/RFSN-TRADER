@@ -1,0 +1,12 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run DTLS Daemon",
+			"type": "shell",
+			"command": "bin/dtls_client 127.0.0.1 13370 client1 4141414141414141414141414141414141414141414141414141414141414141",
+			"isBackground": true,
+			"group": "test"
+		}
+	]
+}

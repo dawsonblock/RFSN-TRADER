@@ -112,15 +112,28 @@ bool connect_upstream() {
         return false;
     }
     freeaddrinfo(res);
-    set_nonblocking(tcp_fd);
+    
+    // Keep BLOCKING for handshake simplicity
+    // set_nonblocking(tcp_fd); 
 
     tls_ssl = SSL_new(tls_ctx);
     SSL_set_fd(tls_ssl, tcp_fd);
     SSL_set_connect_state(tls_ssl);
+    
+    // SNI is critical for Cloudflare/AWS hosted endpoints
+    SSL_set_tlsext_host_name(tls_ssl, UPSTREAM_HOST.c_str());
 
     if (SSL_connect(tls_ssl) <= 0) {
-        // Simple blocking connect
+        ERR_print_errors_fp(stderr);
+        SSL_free(tls_ssl);
+        tls_ssl = nullptr;
+        close(tcp_fd);
+        tcp_fd = -1;
+        return false;
     }
+    
+    // Now set non-blocking for the event loop
+    set_nonblocking(tcp_fd);
     
     std::cout << "[UPSTREAM] Connected to " << UPSTREAM_HOST << "\n";
     return true;
@@ -220,82 +233,81 @@ int main(int argc, char** argv) {
         fds[1].fd = tcp_fd;
         fds[1].events = POLLIN;
 
-        int ret = poll(fds, 2, 1000); // 1s timeout
-        if (ret < 0) break;
-
+        int ret = poll(fds, 2, 100); // 100ms timeout for responsiveness
+        
         // Upstream Maintenance
-        if ((fds[1].revents & (POLLHUP|POLLERR)) || (tcp_fd == -1)) {
-            std::cerr << "[UPSTREAM] Disconnected. Reconnecting...\n";
-            connect_upstream();
+        if (tcp_fd == -1 || (fds[1].revents & (POLLHUP|POLLERR))) {
+            std::cerr << "[UPSTREAM] Connection lost. Reconnecting...\n";
+            if (!connect_upstream()) {
+                sleep(1); // Anti-spam delay
+            }
         }
 
         // --- UDP (Downstream) Handling ---
-        if (fds[0].revents & POLLIN) {
-            if (!connected) {
-                if (!handshaking) {
-                    // LISTEN Phase
-                    int res = DTLSv1_listen(dtls_ssl, peer_addr);
-                    if (res > 0) {
-                        std::cout << "[DTLS] Client Hello Verified.\n";
-                        handshaking = true;
-                        
-                        // Attempt to advance handshake immediately
-                        int acc = SSL_accept(dtls_ssl);
-                        if (acc <= 0) {
-                            int err = SSL_get_error(dtls_ssl, acc);
-                            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
-                                ERR_print_errors_fp(stderr);
-                                reset_dtls_session();
-                            }
-                        } else {
-                            connected = true;
-                            handshaking = false;
-                            std::cout << "[DTLS] Handshake Complete Immediately.\n";
-                        }
-                    } else if (res < 0) {
-                        ERR_clear_error();
-                    }
-                } else {
-                    // HANDSHAKING Phase
-                    int acc = SSL_accept(dtls_ssl);
-                    if (acc > 0) {
-                        connected = true;
-                        handshaking = false;
-                        std::cout << "[DTLS] Handshake Complete.\n";
-                    } else {
-                        int err = SSL_get_error(dtls_ssl, acc);
-                        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
-                             std::cerr << "[DTLS] Handshake Error. Resetting.\n";
-                             ERR_print_errors_fp(stderr);
-                             reset_dtls_session();
-                        }
-                    }
-                }
-            } else {
-                // DATA Phase
+        if (ret > 0 && (fds[0].revents & POLLIN)) {
+            // Check if we need to accept a new connection or read data
+            // Since we only support 1 client, we check 'connected' flag.
+            
+            if (!connected && !handshaking) {
+                 BIO_ADDR *client_addr = BIO_ADDR_new();
+                 // Peek/Listen for ClientHello
+                 // DTLSv1_listen requires the SSL object to be in specific state
+                 // It returns 1 if ClientHello verified with Cookie, 0 if HelloVerifyRequest sent (or invalid)
+                 
+                 // CRITICAL: We need a fresh SSL object for listening if we don't have one active
+                 if (!dtls_ssl) {
+                     dtls_ssl = SSL_new(dtls_ctx);
+                     BIO* bio = BIO_new_dgram(udp_fd, BIO_NOCLOSE);
+                     SSL_set_bio(dtls_ssl, bio, bio);
+                 }
+                 
+                 int res = DTLSv1_listen(dtls_ssl, client_addr);
+                 if (res > 0) {
+                     std::cout << "[DTLS] ClientHello Accepted. Completing Handshake.\n";
+                     handshaking = true;
+                     connected = true; // Optimistic
+                     // For DTLSv1_listen, the SSL object now contains the client address
+                     // We need to call SSL_accept to finish checks
+                 } else {
+                     // Cookie exchange or error. Just continue.
+                     ERR_clear_error();
+                 }
+                 BIO_ADDR_free(client_addr);
+            } 
+            else {
+                // Already connected or handshaking
+                // Try to read
                 char buf[8192];
                 int len = SSL_read(dtls_ssl, buf, sizeof(buf));
                 if (len > 0) {
-                    std::cout << "[DTLS] Received " << len << " bytes. Forwarding...\n";
-                    if (tls_ssl) SSL_write(tls_ssl, buf, len);
+                     std::cout << "[DTLS] Received " << len << " bytes.\n";
+                     if (tls_ssl) SSL_write(tls_ssl, buf, len);
                 } else {
                     int err = SSL_get_error(dtls_ssl, len);
-                    if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
-                        std::cerr << "[DTLS] Read Error/Close. Resetting.\n";
-                        reset_dtls_session();
+                    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                        // Just wait
+                    } else {
+                        std::cout << "[DTLS] Connection Closed/Error (" << err << "). Resetting.\n";
+                        connected = false;
+                        handshaking = false;
+                        if (dtls_ssl) { SSL_free(dtls_ssl); dtls_ssl = nullptr; }
                     }
                 }
             }
         }
-
-        // --- Upstream (TCP) Handling ---
-        if (connected && (fds[1].revents & POLLIN)) {
+        
+        // Upstream Reading
+        if (tcp_fd != -1 && (fds[1].revents & POLLIN)) {
              char buf[8192];
              int len = SSL_read(tls_ssl, buf, sizeof(buf));
              if (len > 0) {
                  if (connected) SSL_write(dtls_ssl, buf, len);
              } else {
-                 connect_upstream();
+                 int err = SSL_get_error(tls_ssl, len);
+                 if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                     std::cerr << "[UPSTREAM] Closed/Error. Reconnecting...\n";
+                     connect_upstream();
+                 }
              }
         }
     }
