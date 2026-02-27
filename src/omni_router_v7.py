@@ -56,54 +56,57 @@ class CUDA_Oracle:
         return mu, sigma
 
 
+
+import subprocess
+
 class HardwareDirectBridge:
     def __init__(self, host='127.0.0.1', port=13370):
         self.host = host
         self.port = port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # In a real scenario, this key would be securely loaded.
-        # It must match the relay's KEY_STORE[1] (currently "A"*32)
-        self.relay_key = b'A' * 32 
-        self.seq = 0
+        self.identity = "client1"
+        self.psk_hex = "41" * 32
+        # Path to client binary
+        self.bin_path = os.path.join(os.path.dirname(__file__), '../bin/dtls_client')
 
     def trigger_fpga_tcp_offload(self, digest, raw_http_bytes, offsets):
         """
-        Sends the specific HTTP packet to the local UDP-TLS Relay.
-        Authenticates via HMAC-SHA256 [SEQ][TS][KEY_ID][HMAC][PAYLOAD].
+        Sends the specific HTTP packet to the local UDP-DTLS Relay using the C++ Client.
         """
-        print(f"[UDP-Relay] Offloading HTTP Packet (Length {len(raw_http_bytes)}) to {self.host}:{self.port}")
-        
-        payload = raw_http_bytes
-        
-        # 1. Header: SEQ (4 bytes, Network Order)
-        seq_bytes = struct.pack('!I', self.seq)
-        self.seq = (self.seq + 1) & 0xFFFFFFFF
-        
-        # 2. Header: TS (8 bytes, Network Order, Nanoseconds)
-        # python 3.7+
-        ts_ns = time.time_ns()
-        ts_bytes = struct.pack('!Q', ts_ns)
-        
-        # 3. Header: KEY_ID (1 byte)
-        key_id_bytes = b'\x01'
-        
-        # 4. Concatenate for signing: SEQ + TS + KEY_ID + PAYLOAD
-        to_sign = seq_bytes + ts_bytes + key_id_bytes + payload
-        
-        # 5. Calculate HMAC (32 bytes)
-        h = hmac.new(self.relay_key, msg=to_sign, digestmod=hashlib.sha256)
-        mac_bytes = h.digest()
-        
-        # 6. Construct Final Packet: [SEQ][TS][KEY_ID][MAC][PAYLOAD]
-        packet = seq_bytes + ts_bytes + key_id_bytes + mac_bytes + payload
-        
         try:
-            self.sock.sendto(packet, (self.host, self.port))
-            print(f"[UDP-Relay] Sent {len(packet)} bytes.")
-            return True
+            msg = raw_http_bytes.decode('ascii')
+        except UnicodeDecodeError:
+            msg = raw_http_bytes.decode('utf-8', errors='ignore')
+            
+        print(f"[DTLS-Relay] Offloading HTTP Packet (Length {len(msg)}) to {self.host}:{self.port}")
+        
+        # Invoke C++ DTLS Client
+        # Usage: ./bin/dtls_client <host> <port> <identity> <psk_key_hex> <message>
+        try:
+            cmd = [
+                self.bin_path,
+                self.host,
+                str(self.port),
+                self.identity,
+                self.psk_hex,
+                msg
+            ]
+            
+            # Using subprocess to execute the client
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False 
+            )
+            
+            if result.returncode != 0:
+                print(f"[ERROR] DTLS Client Failed: {result.stderr}")
+            else:
+                print(f"[SUCCESS] DTLS Client Output: {result.stdout.strip()}")
+                
         except Exception as e:
-            print(f"[UDP-Relay] Error sending packet: {e}")
-            return False
+            print(f"[FAILURE] DTLS Subprocess error: {e}")
+
 
 
 

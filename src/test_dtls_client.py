@@ -1,81 +1,102 @@
 import socket
-import ssl
+import sys
 import time
-import os
-import binascii
+from dtls import do_patch
+from dtls.sslconnection import SSLConnection
+from dtls.err import SSLError
 
-# Attempt to import dtls package (pydtls)
-# Install via: pip install python-dtls
-try:
-    from dtls import do_patch
-    do_patch()
-    # After patching, ssl module supports DTLS
-except ImportError:
-    print("Error: 'python-dtls' not installed. Please install it using: pip install python-dtls")
-    exit(1)
+# This patch enables DTLS support in the python socket module if the 'dtls' package is installed.
+do_patch()
 
-DTLS_SERVER_HOST = '127.0.0.1'
-DTLS_SERVER_PORT = 13370
-PSK_IDENTITY = b'client1'
-PSK_KEY = b'A' * 32  # 32 bytes of 'A'
+# Configuration
+DTLS_HOST = "127.0.0.1"
+DTLS_PORT = 13370
+PSK_IDENTITY = "client1"
+PSK_KEY = b'\x41' * 32 
 
-def psk_cb(identity_hint):
-    # Return (identity, key)
-    # identity_hint is what the server sent (if any)
-    print(f"[*] Server identity hint: {identity_hint}")
-    return (PSK_IDENTITY, PSK_KEY)
+def psk_callback(identity_hint):
+    '''
+    Callback to provide the PSK key and identity.
+    Returns (identity, key) tuple.
+    '''
+    print(f"Server requested PSK. Hint: {identity_hint}")
+    # Identity (bytes), Key (bytes)
+    return PSK_IDENTITY.encode('utf-8'), PSK_KEY
 
 def main():
-    print(f"[*] Connecting to DTLS Server at {DTLS_SERVER_HOST}:{DTLS_SERVER_PORT}")
-    
-    # Create UDP socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    
-    # Wrap with SSL/DTLS
-    # Note: pydtls 'wrap_socket' supports ciphers and psk callbacks if extended properly,
-    # but standard pydtls usually targets certificates. 
-    # Checking pydtls support for PSK... it is limited in the high level API.
-    # We might need to use the lower level OpenSSL wrapper if pydtls doesn't expose PSK easily.
-    # However, let's try to pass the callback if supported or use a simpler approach.
-    
-    # Actually, standard pydtls 1.2.x might not expose set_psk_client_callback easily in wrap_socket.
-    # Let's assume standard behavior or provide a fallback warning.
-    
-    # Alternative: Use 'ssl.SSLContext' if patched
-    ctx = ssl.SSLContext(ssl.PROTOCOL_DTLSv1_2)
-    ctx.set_ciphers("PSK-AES128-CBC-SHA") # Example PSK cipher
-    
-    # pydtls-specific: Context might have set_psk_client_callback
-    if hasattr(ctx, 'set_psk_client_callback'):
-        ctx.set_psk_client_callback(psk_cb)
-    else:
-        # Fallback for standard pydtls if it added it differently or not at all
-        # The 'dtls' package is a wrapper around PyOpenSSL basically.
-        print("[!] Warning: set_psk_client_callback not found. accessing internal OpenSSL Object if possible")
-        # This part is tricky in pure Python without a robust library.
-        # Let's try to proceed.
-        pass
+    print(f"Connecting to DTLS Relay at {DTLS_HOST}:{DTLS_PORT}...")
 
-    # Connect
+    # Create a UDP socket (DTLS uses UDP)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.connect((DTLS_HOST, DTLS_PORT))
+
+    # Wrap the socket with DTLS
     try:
-        dtls_sock = ctx.wrap_socket(sock)
-        dtls_sock.connect((DTLS_SERVER_HOST, DTLS_SERVER_PORT))
-        
-        print("[+] Handshake successful!")
-        
-        # Send data
-        msg = b"GET / HTTP/1.1\r\nHost: clob.polymarket.com\r\n\r\n"
-        print(f"[*] Sending: {msg}")
-        dtls_sock.write(msg)
-        
-        # Read response
-        response = dtls_sock.read(4096)
-        print(f"[+] Received: {response.decode('utf-8', errors='ignore')}")
-        
-        dtls_sock.close()
-        
+        sc = SSLConnection(
+            sock, 
+            keyfile=None, 
+            certfile=None, 
+            server_side=False, 
+            ca_certs=None,
+            do_handshake_on_connect=False,
+            psk_cb=psk_callback,
+            # Force a PSK cipher suite if possible or rely on auto-negotiation
+            ciphers="PSK-AES128-CBC-SHA" 
+        )
     except Exception as e:
-        print(f"[-] Connection failed: {e}")
+        print(f"Failed to create SSLConnection: {e}")
+        return
+
+    try:
+        print("Starting Handshake...")
+        try:
+            sc.connect()
+        except SSLError as e:
+            print(f"DTLS Handshake Failed: {e}")
+            return
+
+        print("DTLS Handshake successful!")
+        print(f"Cipher: {sc.get_cipher_name()}")
+        
+        request = (
+            "GET /time HTTP/1.1\r\n"
+            "Host: clob.polymarket.com\r\n"
+            "User-Agent: DTLS-Test-Client/1.0\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        )
+        
+        print(f"Sending Payload ({len(request)} bytes)...")
+        sc.write(request.encode('utf-8'))
+        
+        print("Reading Response...")
+        
+        sock.settimeout(5.0)
+        
+        while True:
+            try:
+                data = sc.read(4096)
+                if not data:
+                    break
+                print(f"\n--- Response Chunk ({len(data)} bytes) ---")
+                print(data.decode('utf-8', errors='replace'))
+            except socket.timeout:
+                print("\nRead timeout.")
+                break
+            except Exception as e:
+                print(f"\nRead error/Closed: {e}")
+                break
+                
+    except Exception as e:
+        print(f"Connection error: {e}")
+    
+    finally:
+        print("\nClosing connection.")
+        try:
+            sc.shutdown()
+        except:
+            pass
+        sock.close()
 
 if __name__ == "__main__":
     main()
